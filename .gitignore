@@ -1,0 +1,15 @@
+echo "# FastAPI POC" > README.md
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+*.sqlite3
+# Editor
+.vscode/
+.idea/
+.venv/
+env/
+EOF
