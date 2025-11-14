@@ -2,21 +2,27 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional
-import openai
-from langchain.chat_models import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-import os
+from typing import List
 import io
-from dotenv import load_dotenv
+import os
 import uuid
+from dotenv import load_dotenv
+from openai import OpenAI
+import json
+import re
 
 # Load environment variables
 load_dotenv()
 
+# Ensure key exists
+if not os.getenv("OPENAI_API_KEY"):
+    raise RuntimeError("OPENAI_API_KEY not set in environment")
+
+
+client = OpenAI()
+
 app = FastAPI(title="AI Mock Interview API")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -30,15 +36,10 @@ app.add_middleware(
         "X-Current-Question-Index",
         "X-Total-Questions",
         "X-Follow-Up-Count",
+        "X-Repeat-Question",
     ],
 )
 
-# Configure OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
-    raise RuntimeError("OPENAI_API_KEY not set in environment")
-
-# Store interview sessions
 interview_sessions = {}
 
 
@@ -58,68 +59,56 @@ class InterviewSession(BaseModel):
     follow_up_count: int = 0
 
 
-def generate_questions(topic: str, experience_years: int, num_questions: int) -> List[str]:
-    """Generate interview questions based on topic and experience level using GPT-4"""
-    
-    # Determine experience level
-    if experience_years == 0:
-        level = "entry-level or fresher"
-        difficulty = "basic concepts, definitions, and fundamental understanding"
-    elif experience_years <= 2:
-        level = "junior (0-2 years)"
-        difficulty = "intermediate concepts, practical applications, and problem-solving"
-    elif experience_years <= 5:
-        level = "mid-level (3-5 years)"
-        difficulty = "advanced concepts, architecture decisions, optimization, and best practices"
-    else:
-        level = "senior (5+ years)"
-        difficulty = "expert-level concepts, system design, performance optimization, team leadership, and architectural patterns"
-    
-    llm = ChatOpenAI(model="gpt-4", temperature=0.7)
-    
-    system_prompt = f"""You are an experienced technical interviewer creating {num_questions} interview questions.
+def generate_questions(topic: str, experience_years: int, num_questions: int):
+    level = (
+        "entry-level or fresher" if experience_years == 0 else
+        "junior (0-2 years)" if experience_years <= 2 else
+        "mid-level (3-5 years)" if experience_years <= 5 else
+        "senior (5+ years)"
+    )
+
+    difficulty = (
+        "basic concepts" if experience_years == 0 else
+        "intermediate concepts" if experience_years <= 2 else
+        "advanced architectural concepts" if experience_years <= 5 else
+        "expert-level design & leadership concepts"
+    )
+
+    system_prompt = f"""
+You are an experienced interviewer.
+
+Generate exactly {num_questions} interview questions.
 
 Topic: {topic}
-Experience Level: {level} ({experience_years} years)
-Difficulty Focus: {difficulty}
+Experience Level: {level}
+Focus Difficulty: {difficulty}
 
-Generate exactly {num_questions} technical interview questions that are:
-1. Appropriate for a {level} candidate
-2. Focused on {topic}
-3. Progressive in difficulty
-4. Practical and relevant to real-world scenarios
-5. Mix of conceptual and application-based questions
+Rules:
+- Only verbal explanation questions.
+- No coding tasks.
+- Use numbering (1., 2., ...).
+- Return ONLY the numbered questions, no extra commentary.
+"""
 
-IMPORTANT CONSTRAINTS:
-- Do NOT ask questions that require writing code or functions
-- Do NOT ask to implement algorithms or write programs
-- Focus on EXPLAINING concepts, discussing approaches, and verbal reasoning
-- Questions should be answerable through spoken explanations only
-- Ask about "how would you approach", "explain the concept", "what are the differences", etc.
-- Avoid questions starting with "Write", "Implement", "Code", "Create a function"
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Generate {num_questions} questions."}
+        ],
+    )
 
-Format: Return ONLY the questions, one per line, numbered 1-{num_questions}.
-Do not include any other text, explanations, or formatting."""
+    raw = response.choices[0].message.content
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"Generate {num_questions} {topic} interview questions for {level} candidate.")
-    ]
-    
-    response = llm(messages)
-    
-    # Parse questions from response
     questions = []
-    for line in response.content.strip().split('\n'):
+    for line in raw.split("\n"):
         line = line.strip()
         if line:
-            # Remove numbering if present (e.g., "1. ", "1) ", etc.)
-            import re
-            cleaned = re.sub(r'^\d+[\.)]\s*', '', line)
+            cleaned = re.sub(r"^\d+[\.)]\s*", "", line)
             if cleaned:
                 questions.append(cleaned)
-    
-    # Ensure we have the requested number of questions
+
     return questions[:num_questions]
 
 
@@ -127,26 +116,15 @@ Do not include any other text, explanations, or formatting."""
 async def start_interview(config: InterviewConfig):
     try:
         session_id = str(uuid.uuid4())
-        
-        # Generate questions dynamically based on topic and experience
-        questions = generate_questions(
-            config.topic, 
-            config.experience_years, 
-            config.num_questions
-        )
-        
-        if not questions:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to generate questions. Please try again."
-            )
-        
+        questions = generate_questions(config.topic, config.experience_years, config.num_questions)
+
         session = InterviewSession(
             session_id=session_id,
             topic=config.topic,
             experience_years=config.experience_years,
             questions=questions
         )
+
         interview_sessions[session_id] = session
 
         return {
@@ -155,25 +133,26 @@ async def start_interview(config: InterviewConfig):
             "experience_years": config.experience_years,
             "total_questions": len(questions),
         }
+
     except Exception as e:
-        print(f"Error starting interview: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print("Error starting interview:", e)
+        raise HTTPException(500, str(e))
+
 
 
 @app.get("/api/interview/{session_id}/question")
-async def get_current_question(session_id: str):
+async def get_question(session_id: str):
     if session_id not in interview_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(404, "Session not found")
 
     session = interview_sessions[session_id]
+
     if session.current_question_index >= len(session.questions):
         return {"completed": True, "message": "Interview completed!"}
 
-    current_question = session.questions[session.current_question_index]
-
     return {
         "completed": False,
-        "question": current_question,
+        "question": session.questions[session.current_question_index],
         "question_number": session.current_question_index + 1,
         "total_questions": len(session.questions),
         "audio_url": f"/api/interview/{session_id}/audio/question",
@@ -181,133 +160,199 @@ async def get_current_question(session_id: str):
 
 
 @app.get("/api/interview/{session_id}/audio/question")
-async def get_question_audio(session_id: str):
+async def question_audio(session_id: str):
     if session_id not in interview_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(404, "Session not found")
 
     session = interview_sessions[session_id]
 
     if session.current_question_index >= len(session.questions):
-        raise HTTPException(status_code=404, detail="No more questions")
+        raise HTTPException(404, "No more questions")
 
-    current_question = session.questions[session.current_question_index]
+    text = session.questions[session.current_question_index]
 
-    response = openai.audio.speech.create(
-        model="tts-1", voice="alloy", input=current_question
+    audio = client.audio.speech.create(
+        model="tts-1",
+        voice="alloy",
+        input=text
     )
 
-    return StreamingResponse(io.BytesIO(response.content), media_type="audio/mpeg")
+    return StreamingResponse(io.BytesIO(audio.content), media_type="audio/mpeg")
+
+
+def safe_parse_json(text: str):
+    """
+    Try to parse JSON from the model output.
+    1) Direct json.loads
+    2) Extract first JSON object/array substring via regex and parse
+    Returns dict or raises ValueError.
+    """
+    text = text.strip()
+  
+    try:
+        return json.loads(text)
+    except Exception:
+       
+        m = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+        if m:
+            candidate = m.group(1)
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+       
+        m2 = re.search(r"(\[.*\])", text, flags=re.DOTALL)
+        if m2:
+            candidate = m2.group(1)
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+    raise ValueError("No valid JSON found")
+
 
 
 @app.post("/api/interview/{session_id}/answer")
 async def process_answer(session_id: str, audio: UploadFile = File(...)):
     try:
         if session_id not in interview_sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(404, "Session not found")
 
         session = interview_sessions[session_id]
-        audio_content = await audio.read()
+        content = await audio.read()
 
-        # Transcribe audio
-        transcription = openai.audio.transcriptions.create(
-            model="whisper-1", file=("audio.webm", audio_content, "audio/webm")
+
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=("audio.webm", content, "audio/webm")
         )
+        user_answer = transcript.text
 
-        user_answer = transcription.text
         current_question = session.questions[session.current_question_index]
 
-        # Determine experience level context
-        if session.experience_years == 0:
-            exp_context = "entry-level candidate (fresher)"
-        elif session.experience_years <= 2:
-            exp_context = f"junior candidate with {session.experience_years} years of experience"
-        elif session.experience_years <= 5:
-            exp_context = f"mid-level candidate with {session.experience_years} years of experience"
-        else:
-            exp_context = f"senior candidate with {session.experience_years} years of experience"
-
-        # Evaluate answer
-        llm = ChatOpenAI(model="gpt-4", temperature=0.7)
-
-        system_prompt = f"""You are an experienced technical interviewer conducting a {session.topic} interview for a {exp_context}.
-
-Evaluate the candidate's answer considering their experience level.
-
-If the answer is complete and demonstrates good understanding for their level:
-- Start your response with EXACTLY "NEXT_QUESTION" on its own line
-- Then provide brief positive feedback (1-2 sentences)
-
-If the answer is incomplete or needs clarification:
-- Ask ONE specific follow-up question to probe deeper
-- Keep it concise and focused
-- Adjust difficulty based on their experience level
-
-Current question: {current_question}
-Follow-ups asked so far: {session.follow_up_count}/2"""
-
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Candidate's answer: {user_answer}"),
-        ]
-        ai_response = llm(messages)
-        response_text = ai_response.content
-
-        # Determine if we should move to next question
-        should_move_next = (
-            "NEXT_QUESTION" in response_text or session.follow_up_count >= 2
+        exp_level = (
+            "entry-level (fresher)" if session.experience_years == 0 else
+            f"junior ({session.experience_years} years)" if session.experience_years <= 2 else
+            f"mid-level ({session.experience_years} years)" if session.experience_years <= 5 else
+            f"senior ({session.experience_years} years)"
         )
 
-        if should_move_next:
-            # Save conversation history for current question
-            session.conversation_history.append(
-                {
-                    "question": current_question,
-                    "answer": user_answer,
-                    "feedback": response_text.replace("NEXT_QUESTION", "").strip(),
-                }
-            )
 
-            # Move to next question
-            session.current_question_index += 1
-            session.follow_up_count = 0
+        system_prompt = f"""
+You are an interviewer evaluating a {exp_level} candidate.
+You must respond ONLY with a single valid JSON object (no extra commentary).
 
-            # Check if interview is complete
-            is_complete = session.current_question_index >= len(session.questions)
+JSON schema:
+{{
+  "status": "WRONG" | "PARTIAL" | "CORRECT",
+  "message": "string (short explanation / feedback)",
+  "follow_up_question": "string or null",
+  "next_question": "string or null"
+}}
 
-            # Prepare feedback
-            if is_complete:
-                feedback = "Excellent work! You've completed all the questions. Let me prepare your interview summary now."
-            else:
-                feedback = "Great answer! Let's move to the next question."
+Rules:
+- If the answer is totally incorrect or irrelevant → status = "WRONG".
+  Set message explaining briefly why and set follow_up_question=null, next_question=null.
+- If the answer is partially correct → status = "PARTIAL".
+  Set message and set follow_up_question to a single concise follow-up question (string).
+  next_question must be null.
+- If the answer is fully correct → status = "CORRECT".
+  Set message (short positive feedback). You may optionally include next_question (string) but it's not required.
 
-            # Generate feedback audio
-            audio_response = openai.audio.speech.create(
-                model="tts-1", voice="alloy", input=feedback
-            )
+Be careful: return only valid JSON. Example:
+{{"status":"PARTIAL","message":"Missing key tradeoffs","follow_up_question":"What trade-offs would you consider for scaling?", "next_question":null}}
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Question: {current_question}\nAnswer: {user_answer}"}
+            ],
+        )
+
+        model_output = response.choices[0].message.content.strip()
+
+        try:
+            eval_json = safe_parse_json(model_output)
+        except Exception as parse_err:
+            print("Model JSON parse failed:", parse_err)
+            eval_json = {
+                "status": "WRONG",
+                "message": "I couldn't reliably evaluate that answer; please try again.",
+                "follow_up_question": None,
+                "next_question": None
+            }
+
+        status = eval_json.get("status", "").upper()
+        message = eval_json.get("message", "").strip()
+        follow_up_q = eval_json.get("follow_up_question")
+        next_q = eval_json.get("next_question")
+
+
+        if status == "WRONG":
+            speak_text = f"{message or 'That answer was not correct. Please try again.'} I'll repeat the question: {current_question}"
+
+            audio_resp = client.audio.speech.create(model="tts-1", voice="alloy", input=speak_text)
 
             return StreamingResponse(
-                io.BytesIO(audio_response.content),
+                io.BytesIO(audio_resp.content),
                 media_type="audio/mpeg",
                 headers={
-                    "X-Should-Load-Next": "true",
-                    "X-Interview-Complete": str(is_complete).lower(),
+                    "X-Should-Load-Next": "false",
+                    "X-Interview-Complete": "false",
                     "X-Transcription": user_answer,
-                    "X-Current-Question-Index": str(session.current_question_index),
-                    "X-Total-Questions": str(len(session.questions)),
+                    "X-Follow-Up-Count": str(session.follow_up_count),
+                    "X-Repeat-Question": "true",
                 },
             )
-        else:
-            # This is a follow-up
-            session.follow_up_count += 1
-            feedback = response_text
 
-            # Generate feedback audio
-            audio_response = openai.audio.speech.create(
-                model="tts-1", voice="alloy", input=feedback
-            )
+
+        if status == "PARTIAL":
+            
+            session.follow_up_count += 1
+
+            
+            if session.follow_up_count >= 2:
+                
+                session.conversation_history.append({
+                    "question": current_question,
+                    "answer": user_answer,
+                    "feedback": message or "Partial answer (follow-ups completed)."
+                })
+
+               
+                session.current_question_index += 1
+                session.follow_up_count = 0
+
+                
+                speak_text = "Thanks. Let's move to the next question."
+                audio_resp = client.audio.speech.create(model="tts-1", voice="alloy", input=speak_text)
+
+                interview_complete = session.current_question_index >= len(session.questions)
+
+                return StreamingResponse(
+                    io.BytesIO(audio_resp.content),
+                    media_type="audio/mpeg",
+                    headers={
+                        "X-Should-Load-Next": "true",
+                        "X-Interview-Complete": str(interview_complete).lower(),
+                        "X-Transcription": user_answer,
+                        "X-Follow-Up-Count": "0",
+                    },
+                )
+
+            
+            follow_up_text = follow_up_q or "Could you clarify that part in more detail?"
+
+            
+            speak_text = f"{message}. {follow_up_text}"
+
+            audio_resp = client.audio.speech.create(model="tts-1", voice="alloy", input=speak_text)
 
             return StreamingResponse(
-                io.BytesIO(audio_response.content),
+                io.BytesIO(audio_resp.content),
                 media_type="audio/mpeg",
                 headers={
                     "X-Should-Load-Next": "false",
@@ -316,69 +361,110 @@ Follow-ups asked so far: {session.follow_up_count}/2"""
                     "X-Follow-Up-Count": str(session.follow_up_count),
                 },
             )
+
+
+        if status == "CORRECT":
+            
+            session.conversation_history.append({
+                "question": current_question,
+                "answer": user_answer,
+                "feedback": message or "Good answer."
+            })
+
+            session.current_question_index += 1
+            session.follow_up_count = 0
+
+            interview_complete = session.current_question_index >= len(session.questions)
+
+            
+            speak_text = message or ("Great! Moving to the next question." if not interview_complete else "You have completed the interview. Preparing summary.")
+
+            audio_resp = client.audio.speech.create(model="tts-1", voice="alloy", input=speak_text)
+
+            return StreamingResponse(
+                io.BytesIO(audio_resp.content),
+                media_type="audio/mpeg",
+                headers={
+                    "X-Should-Load-Next": "true",
+                    "X-Interview-Complete": str(interview_complete).lower(),
+                    "X-Transcription": user_answer,
+                },
+            )
+
+        
+        speak_text = "I couldn't interpret the evaluation. Please try answering again."
+        audio_resp = client.audio.speech.create(model="tts-1", voice="alloy", input=speak_text)
+        return StreamingResponse(
+            io.BytesIO(audio_resp.content),
+            media_type="audio/mpeg",
+            headers={
+                "X-Should-Load-Next": "false",
+                "X-Interview-Complete": "false",
+                "X-Transcription": user_answer,
+                "X-Follow-Up-Count": str(session.follow_up_count),
+                "X-Repeat-Question": "true",
+            },
+        )
+
     except Exception as e:
-        print(f"Error in process_answer: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        print("Error in process_answer:", e)
+        raise HTTPException(500, str(e))
+
 
 
 @app.get("/api/interview/{session_id}/summary")
-async def get_interview_summary(session_id: str):
+async def get_summary(session_id: str):
     if session_id not in interview_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(404, "Session not found")
 
     session = interview_sessions[session_id]
-    llm = ChatOpenAI(model="gpt-4", temperature=0.7)
 
-    conversation_summary = "\n\n".join(
-        [
-            f"Q: {item['question']}\nA: {item['answer']}\nFeedback: {item['feedback']}"
-            for item in session.conversation_history
-        ]
+    summary_text = ""
+    for item in session.conversation_history:
+        summary_text += f"Q: {item['question']}\nA: {item['answer']}\nFeedback: {item['feedback']}\n\n"
+
+    exp_level = (
+        "entry-level/fresher" if session.experience_years == 0 else
+        "junior" if session.experience_years <= 2 else
+        "mid-level" if session.experience_years <= 5 else
+        "senior"
     )
 
-    # Experience level context for summary
-    if session.experience_years == 0:
-        exp_level = "entry-level/fresher"
-    elif session.experience_years <= 2:
-        exp_level = "junior (0-2 years)"
-    elif session.experience_years <= 5:
-        exp_level = "mid-level (3-5 years)"
-    else:
-        exp_level = "senior (5+ years)"
-
-    system_prompt = f"""Provide a constructive summary of the candidate's {session.topic} interview.
-Candidate Experience Level: {exp_level} ({session.experience_years} years)
-
+    system_prompt = f"""
+Provide a constructive interview summary for a {exp_level} candidate.
 Include:
-1. Overall performance rating considering their experience level (e.g., "Strong", "Good", "Needs Improvement")
-2. Key strengths demonstrated
-3. Areas for improvement specific to their level
-4. Specific topics to study further
-5. Career advice and next steps appropriate for their experience
-6. Encouraging final remarks
+- Overall performance rating
+- Strengths
+- Weaknesses
+- Topics to improve
+- Encouraging closing notes
+Keep it short.
+"""
 
-Keep it concise and actionable. Adjust expectations based on their experience level."""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.7,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": summary_text}
+        ],
+    )
 
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"Interview conversation:\n\n{conversation_summary}"),
-    ]
-    summary = llm(messages)
+    summary = response.choices[0].message.content
 
     return {
         "session_id": session_id,
         "topic": session.topic,
         "experience_years": session.experience_years,
         "questions_completed": len(session.conversation_history),
-        "summary": summary.content,
-        "conversation_history": session.conversation_history,
+        "summary": summary,
+        "conversation_history": session.conversation_history
     }
 
 
+
 @app.get("/api/topics")
-async def get_available_topics():
+async def get_topics():
     return {
         "topics": [
             "React",
@@ -397,6 +483,7 @@ async def get_available_topics():
             "Machine Learning"
         ]
     }
+
 
 
 if __name__ == "__main__":
