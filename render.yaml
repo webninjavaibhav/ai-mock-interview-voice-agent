@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: ai-mock-interview-voice-agent
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      PYTHON_VERSION: 3.12.3
