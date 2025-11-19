@@ -579,11 +579,17 @@ async def get_topics():
             "React",
             "JavaScript",
             "Next.js",
+            "React Native",
             "Python",
+            "Fast API",
             "Node.js",
+            "Express",
+            "Nest",
+            "MongoDB",
             "TypeScript",
+            "Supabase",
+            "Firebase",
             "System Design",
-            "Data Structures & Algorithms",
             "SQL & Databases",
             "Vue.js",
             "Angular",
@@ -591,11 +597,7 @@ async def get_topics():
             "DevOps",
             "Machine Learning",
             "Docker",
-            "Kubernetes",
-            "Java",
-            "C++",
-            "Go",
-            "Rust"
+            "Kubernetes"
         ]
     }
 
