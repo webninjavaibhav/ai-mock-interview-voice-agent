@@ -575,13 +575,13 @@ Keep it concise but comprehensive.
 @app.get("/api/topics")
 async def get_topics():
     return {
-        "topics": [
+"topics": [
             "React",
             "JavaScript",
             "Next.js",
             "React Native",
             "Python",
-            "Fast API",
+            "FastAPI",
             "Node.js",
             "Express",
             "Nest",
@@ -597,7 +597,17 @@ async def get_topics():
             "DevOps",
             "Machine Learning",
             "Docker",
-            "Kubernetes"
+            "Kubernetes",
+            "AI Agent",
+            "Multi-Agent Systems",
+            "LangChain",
+            "LangGraph",
+            "Pinecone",
+            "Weaviate",
+            "Chroma",
+            "Milvus",
+            "FAISS",
+            "Redis Vector DB"
         ]
     }
 
