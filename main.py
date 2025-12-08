@@ -586,6 +586,8 @@ async def get_topics():
             "Express",
             "Nest",
             "MongoDB",
+            "Agile",
+            "GIT",
             "TypeScript",
             "Supabase",
             "Firebase",
